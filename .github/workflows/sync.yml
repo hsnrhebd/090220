@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    - cron: "0 4 * * 0" # 每周日北京时间中午 12:00（UTC 4:00）自动执行
   workflow_dispatch:
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     steps:
       # Step 1: run a standard checkout action
       - name: Checkout target repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4 # 签出当前仓库代码
 
       # Step 2: run the sync action
       - name: Sync upstream changes
@@ -32,9 +32,18 @@ jobs:
           # Set test_mode true to run tests instead of the true action!!
           test_mode: false
 
+      # Step 3: Sync check
       - name: Sync check
         if: failure()
         run: |
           echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，你需要手动 Sync Fork 一次，详细教程请查看项目README.md "
           echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork. Please refer to the project README.md for instructions. "
           exit 1
+
+      # Step 4: 强行将最新的 _worker.js 推送到 Cloudflare Worker
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }} # 读取你在 GitHub 塞入的 API 令牌
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }} # 读取你在 GitHub 塞入的账户 ID
+          command: deploy _worker.js --name=v20251104 # 强行注入到你名为 v20251104 的 Worker
