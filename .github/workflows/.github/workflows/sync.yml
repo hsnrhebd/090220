@@ -1,0 +1,17 @@
+name: Sync Upstream
+on:
+  schedule:
+    - cron: '0 4 * * 0' # 每周日北京时间中午 12:00（UTC 4:00）自动执行
+  workflow_dispatch: # 允许你随时手动点击按钮触发同步
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync upstream changes
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          target_branch: main  # 你的分支名
+          upstream_repo: cmliu/edgetunnel  # 作者的仓库
+          upstream_branch: main  # 作者的分支名
