@@ -42,6 +42,7 @@ jobs:
 
       # Step 4: 强行将最新的 _worker.js 推送到 Cloudflare Worker
       - name: Deploy to Cloudflare Workers
+        if: success()
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }} # 读取你在 GitHub 塞入的 API 令牌
