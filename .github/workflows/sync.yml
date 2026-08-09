@@ -46,4 +46,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }} # 读取你在 GitHub 塞入的 API 令牌
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }} # 读取你在 GitHub 塞入的账户 ID
-          command: deploy _worker.js --name=v20251104 # 强行注入到你名为 v20251104 的 Worker
+          command: deploy
