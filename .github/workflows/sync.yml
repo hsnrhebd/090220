@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 4 1 * *" # 每周日北京时间中午 12:00（UTC 4:00）自动执行
+    - cron: "0 4 1 * *" # 每月1号北京时间中午 12:00（UTC 4:00）自动执行
   workflow_dispatch:
 
 jobs:
@@ -47,4 +47,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }} # 读取你在 GitHub 塞入的 API 令牌
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }} # 读取你在 GitHub 塞入的账户 ID
-          command: deploy
+          command: deploy--force
