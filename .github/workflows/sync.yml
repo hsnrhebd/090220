@@ -69,7 +69,7 @@ jobs:
 
       - name: Deploy to Cloudflare Workers (force)
         if: steps.check.outputs.has_update == 'true'
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v3.14
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
