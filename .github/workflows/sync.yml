@@ -17,18 +17,19 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ------------------------------------------------------------
+
+      # ============================================================
       # 1. 获取当前 Fork
-      # ------------------------------------------------------------
+      # ============================================================
       - name: Checkout target repo
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: main
 
-      # ------------------------------------------------------------
-      # 2. 获取 CM upstream
-      # ------------------------------------------------------------
+      # ============================================================
+      # 2. 获取 CM upstream，并检查是否真的有代码更新
+      # ============================================================
       - name: Check upstream for updates
         id: upstream
         shell: bash
@@ -41,51 +42,114 @@ jobs:
           git remote add upstream https://github.com/cmliu/edgetunnel.git
           git fetch upstream main
 
-          LOCAL_SHA="$(git rev-parse HEAD)"
-          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+          echo "Checking CM upstream changes..."
 
-          echo "Current Fork commit : ${LOCAL_SHA}"
-          echo "CM upstream commit  : ${UPSTREAM_SHA}"
+          # 我们自己的 Workflow 不参与更新判断。
+          #
+          # 原因：
+          # .github/workflows/sync.yml 是我们自己的自动化文件，
+          # 不能因为它和 CM 不一样，就一直认为 CM 有更新。
+          if git diff --quiet HEAD upstream/main -- \
+              . \
+              ':(exclude).github/workflows/sync.yml'; then
 
-          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream changes detected."
+            echo "No EdgeTunnel code changes detected."
+
           else
+
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Upstream has new commits."
+            echo "New EdgeTunnel changes detected from CM."
+
           fi
 
-      # ------------------------------------------------------------
-      # 3. 没有更新：直接结束
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. 没有 CM 更新，直接结束
+      # ============================================================
       - name: No upstream changes
         if: steps.upstream.outputs.changed == 'false'
         run: |
-          echo "CM has no new commits."
-          echo "Nothing to sync and nothing to deploy."
+          echo "CM has no new EdgeTunnel code changes."
+          echo "Nothing to sync."
+          echo "Nothing to deploy."
 
-      # ------------------------------------------------------------
-      # 4. 有更新：让 Fork 完全跟随 CM
-      # ------------------------------------------------------------
+      # ============================================================
+      # 4. 保存我们自己的 sync.yml
+      # ============================================================
+      - name: Backup local workflow
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p /tmp/local-workflow
+
+          cp .github/workflows/sync.yml \
+             /tmp/local-workflow/sync.yml
+
+          echo "Local sync workflow backed up."
+
+      # ============================================================
+      # 5. 同步 CM 最新代码
+      # ============================================================
       - name: Sync CM upstream
         if: steps.upstream.outputs.changed == 'true'
         shell: bash
         run: |
           set -e
 
-          echo "Syncing main with cmliu/edgetunnel..."
+          echo "Syncing EdgeTunnel with cmliu/edgetunnel..."
 
-          # 当前仓库没有需要保留的私人修改，
-          # 因此直接让 main 对齐 CM upstream/main。
+          # 先让仓库完整对齐 CM。
           git reset --hard upstream/main
 
-          git push --force-with-lease origin main
+          # 恢复我们自己的自动部署 Workflow。
+          mkdir -p .github/workflows
 
-          echo "CM sync completed successfully."
+          cp /tmp/local-workflow/sync.yml \
+             .github/workflows/sync.yml
 
-      # ------------------------------------------------------------
-      # 5. 检查生产部署配置
-      # ------------------------------------------------------------
+          echo "CM source synchronized."
+          echo "Local deployment workflow preserved."
+
+      # ============================================================
+      # 6. 提交同步结果
+      # ============================================================
+      - name: Commit synced EdgeTunnel
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          git add -A
+
+          # 检查是否真的存在需要提交的变化。
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "Sync latest EdgeTunnel from CM"
+
+          echo "Sync commit created."
+
+      # ============================================================
+      # 7. Push 回自己的 GitHub Fork
+      # ============================================================
+      - name: Push synced EdgeTunnel
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          git push origin main
+
+          echo "Push completed successfully."
+
+      # ============================================================
+      # 8. 检查生产部署配置
+      # ============================================================
       - name: Verify production deployment configuration
         if: steps.upstream.outputs.changed == 'true'
         shell: bash
@@ -94,30 +158,41 @@ jobs:
 
           echo "Checking EdgeTunnel production configuration..."
 
-          # 必须存在核心 Worker 文件
-          test -f "_worker.js" || {
+          # ----------------------------------------------------------
+          # 必须存在 Worker 主文件
+          # ----------------------------------------------------------
+          if [ ! -f "_worker.js" ]; then
             echo "[ERROR] _worker.js not found."
-            exit 1
-          }
-
-          test -f "wrangler.toml" || {
-            echo "[ERROR] wrangler.toml not found."
-            exit 1
-          }
-
-          # 当前生产 Worker 必须是 v20251104
-          if ! grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"v20251104"[[:space:]]*$' wrangler.toml; then
-            echo "[ERROR] wrangler.toml does not define Worker name v20251104."
             exit 1
           fi
 
-          echo "Worker name check passed."
+          # ----------------------------------------------------------
+          # 必须存在 Wrangler 配置
+          # ----------------------------------------------------------
+          if [ ! -f "wrangler.toml" ]; then
+            echo "[ERROR] wrangler.toml not found."
+            exit 1
+          fi
 
-          # 生成临时生产配置。
-          # 这是部署专用配置，不会提交回 GitHub。
+          # ----------------------------------------------------------
+          # 必须部署到我们已经存在的 Worker
+          # ----------------------------------------------------------
+          if ! grep -Eq \
+            '^[[:space:]]*name[[:space:]]*=[[:space:]]*"v20251104"[[:space:]]*$' \
+            wrangler.toml; then
+
+            echo "[ERROR] Worker name is not v20251104."
+            echo "[ERROR] Deployment stopped for safety."
+            exit 1
+          fi
+
+          echo "Worker name check passed: v20251104"
+
+          # ----------------------------------------------------------
+          # 创建临时生产 Wrangler 配置
+          # ----------------------------------------------------------
           cp wrangler.toml wrangler.production.toml
 
-          # 删除可能存在的旧 KV 配置行/区块后再加入唯一的生产 KV binding。
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -125,15 +200,14 @@ jobs:
           path = Path("wrangler.production.toml")
           text = path.read_text()
 
-          # 删除 TOML 中已有的 kv_namespaces 数组区块。
-          # 当前 CM 配置是注释形式，这里同时兼容已经存在的实际配置。
+          # 删除已有的 kv_namespaces 区块。
           text = re.sub(
               r'(?ms)^\[\[kv_namespaces\]\]\s*.*?(?=^\[\[|\Z)',
               '',
               text
           )
 
-          # 删除旧的 JSON/TOML inline kv_namespaces 配置（如果未来上游改成这种形式）。
+          # 删除可能存在的 inline kv_namespaces 配置。
           text = re.sub(
               r'(?ms)^[ \t]*kv_namespaces[ \t]*=[ \t]*\[.*?\]\s*$',
               '',
@@ -150,29 +224,33 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "Production Wrangler configuration generated."
+          echo "Production Wrangler configuration created."
 
-          echo "----- Production Wrangler configuration -----"
-          cat wrangler.production.toml
-          echo "---------------------------------------------"
+          # ----------------------------------------------------------
+          # 最终安全检查
+          # ----------------------------------------------------------
+          if ! grep -q \
+            'binding = "KV"' \
+            wrangler.production.toml; then
 
-          # 最终强制检查 KV ID。
-          if ! grep -q 'id = "5f8641c6c7824c269e8473a962083248"' wrangler.production.toml; then
+            echo "[ERROR] KV binding is missing."
+            exit 1
+          fi
+
+          if ! grep -q \
+            'id = "5f8641c6c7824c269e8473a962083248"' \
+            wrangler.production.toml; then
+
             echo "[ERROR] Production KV namespace ID is incorrect."
             exit 1
           fi
 
-          # 最终强制检查 KV binding。
-          if ! grep -q 'binding = "KV"' wrangler.production.toml; then
-            echo "[ERROR] Production KV binding is missing."
-            exit 1
-          fi
+          echo "KV binding check passed."
+          echo "Production configuration is safe to deploy."
 
-          echo "KV configuration check passed."
-
-      # ------------------------------------------------------------
-      # 6. 部署到已经存在的 v20251104 Worker
-      # ------------------------------------------------------------
+      # ============================================================
+      # 9. 部署到已经存在的 EdgeTunnel Worker
+      # ============================================================
       - name: Deploy existing EdgeTunnel Worker
         if: steps.upstream.outputs.changed == 'true'
         uses: cloudflare/wrangler-action@v4
@@ -181,12 +259,13 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy --config wrangler.production.toml
 
-      # ------------------------------------------------------------
-      # 7. 清理临时生产配置
-      # ------------------------------------------------------------
+      # ============================================================
+      # 10. 删除临时生产配置
+      # ============================================================
       - name: Remove temporary production configuration
         if: always() && steps.upstream.outputs.changed == 'true'
         shell: bash
         run: |
           rm -f wrangler.production.toml
+
           echo "Temporary production configuration removed."
