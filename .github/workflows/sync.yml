@@ -1,44 +1,192 @@
-name: Upstream Sync
+name: Upstream Sync & Deploy EdgeTunnel
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "0 0 * * *" # every day
+    # 每月 1 日和 15 日 00:00 UTC 检查一次 CM
+    - cron: "0 0 1,15 * *"
   workflow_dispatch:
 
 jobs:
   sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+    name: Sync CM and deploy existing EdgeTunnel Worker
     runs-on: ubuntu-latest
     if: ${{ github.event.repository.fork }}
+    timeout-minutes: 30
 
     steps:
+      # ------------------------------------------------------------
+      # 1. 获取当前 Fork
+      # ------------------------------------------------------------
       - name: Checkout target repo
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: main
 
-      - name: Sync upstream changes
+      # ------------------------------------------------------------
+      # 2. 获取 CM upstream
+      # ------------------------------------------------------------
+      - name: Check upstream for updates
+        id: upstream
+        shell: bash
         run: |
+          set -e
+
           git config user.name "GH Action - Upstream Sync"
           git config user.email "action@github.com"
 
           git remote add upstream https://github.com/cmliu/edgetunnel.git
           git fetch upstream main
 
-          if git diff --quiet HEAD upstream/main; then
-            # 内容和上游一致，直接对齐，顺带清理历史分叉留下的多余 merge commit
-            git reset --hard upstream/main
-            git push --force-with-lease origin main
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+
+          echo "Current Fork commit : ${LOCAL_SHA}"
+          echo "CM upstream commit  : ${UPSTREAM_SHA}"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes detected."
           else
-            # 有本地修改，保持原来的合并方式，不覆盖任何人的改动
-            if ! git pull --no-rebase upstream main; then
-              echo "[Error] 合并上游变更产生冲突，自动同步已暂停，请手动 Sync Fork 并解决冲突。"
-              echo "[Error] Merge conflict detected while syncing upstream. Please sync your fork manually and resolve the conflicts."
-              exit 1
-            fi
-            git push origin main
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits."
           fi
+
+      # ------------------------------------------------------------
+      # 3. 没有更新：直接结束
+      # ------------------------------------------------------------
+      - name: No upstream changes
+        if: steps.upstream.outputs.changed == 'false'
+        run: |
+          echo "CM has no new commits."
+          echo "Nothing to sync and nothing to deploy."
+
+      # ------------------------------------------------------------
+      # 4. 有更新：让 Fork 完全跟随 CM
+      # ------------------------------------------------------------
+      - name: Sync CM upstream
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          echo "Syncing main with cmliu/edgetunnel..."
+
+          # 当前仓库没有需要保留的私人修改，
+          # 因此直接让 main 对齐 CM upstream/main。
+          git reset --hard upstream/main
+
+          git push --force-with-lease origin main
+
+          echo "CM sync completed successfully."
+
+      # ------------------------------------------------------------
+      # 5. 检查生产部署配置
+      # ------------------------------------------------------------
+      - name: Verify production deployment configuration
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          echo "Checking EdgeTunnel production configuration..."
+
+          # 必须存在核心 Worker 文件
+          test -f "_worker.js" || {
+            echo "[ERROR] _worker.js not found."
+            exit 1
+          }
+
+          test -f "wrangler.toml" || {
+            echo "[ERROR] wrangler.toml not found."
+            exit 1
+          }
+
+          # 当前生产 Worker 必须是 v20251104
+          if ! grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"v20251104"[[:space:]]*$' wrangler.toml; then
+            echo "[ERROR] wrangler.toml does not define Worker name v20251104."
+            exit 1
+          fi
+
+          echo "Worker name check passed."
+
+          # 生成临时生产配置。
+          # 这是部署专用配置，不会提交回 GitHub。
+          cp wrangler.toml wrangler.production.toml
+
+          # 删除可能存在的旧 KV 配置行/区块后再加入唯一的生产 KV binding。
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("wrangler.production.toml")
+          text = path.read_text()
+
+          # 删除 TOML 中已有的 kv_namespaces 数组区块。
+          # 当前 CM 配置是注释形式，这里同时兼容已经存在的实际配置。
+          text = re.sub(
+              r'(?ms)^\[\[kv_namespaces\]\]\s*.*?(?=^\[\[|\Z)',
+              '',
+              text
+          )
+
+          # 删除旧的 JSON/TOML inline kv_namespaces 配置（如果未来上游改成这种形式）。
+          text = re.sub(
+              r'(?ms)^[ \t]*kv_namespaces[ \t]*=[ \t]*\[.*?\]\s*$',
+              '',
+              text
+          )
+
+          text = text.rstrip() + """
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "5f8641c6c7824c269e8473a962083248"
+          """
+
+          path.write_text(text)
+          PY
+
+          echo "Production Wrangler configuration generated."
+
+          echo "----- Production Wrangler configuration -----"
+          cat wrangler.production.toml
+          echo "---------------------------------------------"
+
+          # 最终强制检查 KV ID。
+          if ! grep -q 'id = "5f8641c6c7824c269e8473a962083248"' wrangler.production.toml; then
+            echo "[ERROR] Production KV namespace ID is incorrect."
+            exit 1
+          fi
+
+          # 最终强制检查 KV binding。
+          if ! grep -q 'binding = "KV"' wrangler.production.toml; then
+            echo "[ERROR] Production KV binding is missing."
+            exit 1
+          fi
+
+          echo "KV configuration check passed."
+
+      # ------------------------------------------------------------
+      # 6. 部署到已经存在的 v20251104 Worker
+      # ------------------------------------------------------------
+      - name: Deploy existing EdgeTunnel Worker
+        if: steps.upstream.outputs.changed == 'true'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config wrangler.production.toml
+
+      # ------------------------------------------------------------
+      # 7. 清理临时生产配置
+      # ------------------------------------------------------------
+      - name: Remove temporary production configuration
+        if: always() && steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          rm -f wrangler.production.toml
+          echo "Temporary production configuration removed."
