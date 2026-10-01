@@ -1,0 +1,157 @@
+name: Deploy EdgeTunnel Worker (One-shot)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build production config and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ============================================================
+      # 1. 环境信息
+      # ============================================================
+      - name: Print environment info
+        run: |
+          echo "Repository : ${{ github.repository }}"
+          echo "Actor      : ${{ github.actor }}"
+          echo "UTC Time   : $(date -u +'%Y-%m-%d %H:%M:%S')"
+
+      # ============================================================
+      # 2. Checkout
+      # ============================================================
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      # ============================================================
+      # 3. 校验配置
+      # ============================================================
+      - name: Validate required configuration
+        env:
+          CF_WORKER_NAME: ${{ vars.CF_WORKER_NAME }}
+          CF_KV_ID: ${{ vars.CF_KV_ID }}
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -e
+          echo "检查配置..."
+          missing=0
+
+          [ -z "$CF_WORKER_NAME" ] && { echo "::error::缺少 Variable: CF_WORKER_NAME"; missing=1; } \
+            || echo "  OK  CF_WORKER_NAME = $CF_WORKER_NAME"
+
+          [ -z "$CF_KV_ID" ] && { echo "::error::缺少 Variable: CF_KV_ID"; missing=1; } \
+            || echo "  OK  CF_KV_ID = $CF_KV_ID"
+
+          [ -z "$CF_API_TOKEN" ] && { echo "::error::缺少 Secret: CLOUDFLARE_API_TOKEN"; missing=1; } \
+            || echo "  OK  CLOUDFLARE_API_TOKEN = (已设置)"
+
+          [ -z "$CF_ACCOUNT_ID" ] && { echo "::error::缺少 Secret: CLOUDFLARE_ACCOUNT_ID"; missing=1; } \
+            || echo "  OK  CLOUDFLARE_ACCOUNT_ID = (已设置)"
+
+          [ "$missing" -eq 1 ] && exit 1
+          echo "配置检查通过。"
+
+      # ============================================================
+      # 4. 校验仓库文件
+      # ============================================================
+      - name: Verify repository files
+        run: |
+          set -e
+          for f in _worker.js wrangler.toml; do
+            [ -f "$f" ] || { echo "::error::缺少必需文件: $f"; exit 1; }
+            echo "  OK  $f"
+          done
+
+      # ============================================================
+      # 5. 生成生产配置
+      # ============================================================
+      - name: Generate wrangler.production.toml
+        env:
+          CF_WORKER_NAME: ${{ vars.CF_WORKER_NAME }}
+          CF_KV_ID: ${{ vars.CF_KV_ID }}
+        run: |
+          set -e
+          cp wrangler.toml wrangler.production.toml
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, os
+
+          path = Path("wrangler.production.toml")
+          text = path.read_text()
+          worker_name = os.environ["CF_WORKER_NAME"]
+          kv_id = os.environ["CF_KV_ID"]
+
+          # 覆盖 Worker name
+          if re.search(r'(?m)^[ \t]*name[ \t]*=', text):
+              text = re.sub(
+                  r'(?m)^[ \t]*name[ \t]*=.*$',
+                  f'name = "{worker_name}"',
+                  text, count=1,
+              )
+          else:
+              text = f'name = "{worker_name}"\n' + text
+
+          # 清除旧 kv_namespaces（含注释形式）
+          text = re.sub(
+              r'(?ms)^[ \t]*#?[ \t]*\[\[kv_namespaces\]\].*?(?=^[ \t]*#?[ \t]*\[\[|\Z)',
+              '', text,
+          )
+          text = re.sub(
+              r'(?ms)^[ \t]*#?[ \t]*kv_namespaces[ \t]*=[ \t]*\[.*?\]\s*$',
+              '', text,
+          )
+
+          # 注入 KV 绑定
+          text = text.rstrip() + f'\n\n[[kv_namespaces]]\nbinding = "KV"\nid = "{kv_id}"\n'
+          path.write_text(text)
+          print(text)
+          PY
+
+          # 自检
+          grep -q "^name = \"$CF_WORKER_NAME\"" wrangler.production.toml \
+            || { echo "::error::Worker name 校验失败"; exit 1; }
+          grep -q 'binding = "KV"' wrangler.production.toml \
+            || { echo "::error::KV binding 缺失"; exit 1; }
+          grep -q "id = \"$CF_KV_ID\"" wrangler.production.toml \
+            || { echo "::error::KV id 校验失败"; exit 1; }
+          echo "生产配置生成完毕。"
+
+      # ============================================================
+      # 6. 部署
+      # ============================================================
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config wrangler.production.toml
+
+      # ============================================================
+      # 7. 清理
+      # ============================================================
+      - name: Cleanup
+        if: always()
+        run: rm -f wrangler.production.toml
+
+      # ============================================================
+      # 8. 失败时诊断
+      # ============================================================
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "::error::部署失败。"
+          echo "Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "常见原因:"
+          echo "  1) CF_KV_ID 错误 / KV 不存在"
+          echo "  2) API Token 权限不足或已失效"
+          echo "  3) Account ID 不对"
+          echo "  4) _worker.js 语法错误"
